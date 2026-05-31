@@ -36,8 +36,13 @@ GROQ_KEYS = [
 # ID Telegram lo — buat nerima notif /start. Cara cari: chat ke @userinfobot
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
+# Whitelist grup — pisah pake koma kalau lebih dari 1, contoh: "-100123,-100456"
+# Kalau dikosongkan, bot aktif di SEMUA grup (tidak disarankan)
+_raw = os.environ.get("GROUP_IDS", "")
+ALLOWED_GROUP_IDS = [int(x.strip()) for x in _raw.split(",") if x.strip()]
+
 # Probabilitas bot bales pesan di GRUP (0.0 - 1.0)
-REPLY_CHANCE = 0.4
+REPLY_CHANCE = 0.8
 
 # Di DM privat bot selalu bales
 DM_ALWAYS_REPLY = True
@@ -123,7 +128,7 @@ def call_gemini(prompt: str) -> str | None:
         try:
             genai.configure(api_key=key)
             model = genai.GenerativeModel(
-                model_name="gemini-2.5-flash",
+                model_name="gemini-2.5-flash-lite",
                 system_instruction=SYSTEM_PROMPT
             )
             response = model.generate_content(prompt)
@@ -218,6 +223,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_private:
         should_reply = DM_ALWAYS_REPLY
     elif is_group:
+        # Cek whitelist grup — skip kalau bukan grup yang diizinkan
+        if ALLOWED_GROUP_IDS and message.chat_id not in ALLOWED_GROUP_IDS:
+            return
         has_keyword = any(kw in text for kw in TRIGGER_KEYWORDS)
         should_reply = has_keyword or (random.random() < REPLY_CHANCE)
     else:
