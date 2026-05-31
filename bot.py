@@ -2,6 +2,8 @@ import os
 import random
 import logging
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from itertools import cycle
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
@@ -34,10 +36,10 @@ GROQ_KEYS = [
 # ID Telegram lo — buat nerima notif /start. Cara cari: chat ke @userinfobot
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 
-# Probabilitas bot bales pesan di GRUP (0.0 - 1.0). 0.4 = 40% chance
-REPLY_CHANCE = 0.9
+# Probabilitas bot bales pesan di GRUP (0.0 - 1.0)
+REPLY_CHANCE = 0.4
 
-# Di DM privat bot SELALU bales (bisa diubah ke REPLY_CHANCE juga kalau mau)
+# Di DM privat bot selalu bales
 DM_ALWAYS_REPLY = True
 
 # Persona bot
@@ -47,12 +49,31 @@ Sometimes skeptical, sometimes bullish, always sounding like a real person.
 Match the language of whoever you're talking to.
 Never reveal you are an AI or a bot."""
 
-# Kata kunci yang WAJIB ditrigger di grup (probabilitas jadi 100%)
+# Kata kunci trigger di grup
 TRIGGER_KEYWORDS = [
-    "btc", "bitcoin", "eth", "ethereum", "pump", "dump", "bull", "bear", "early",
+    "btc", "bitcoin", "eth", "ethereum", "pump", "dump", "bull", "bear",
     "altcoin", "solana", "sol", "bnb", "crypto", "kripto", "kapan", "prediksi",
     "scam", "rug", "hodl", "dca", "staking", "airdrop", "nft", "defi", "cuan"
 ]
+
+# ============================================================
+# HEALTH CHECK SERVER — wajib buat Render free tier
+# ============================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # supaya ga spam log
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health check server jalan di port {port}")
+    server.serve_forever()
 
 # ============================================================
 # KEY ROTATOR
@@ -98,7 +119,6 @@ def call_gemini(prompt: str) -> str | None:
     for attempt in range(len(GEMINI_KEYS)):
         key = gemini_rotator.next_key()
         if not key:
-            logger.error("Semua Gemini keys exhausted!")
             return None
         try:
             genai.configure(api_key=key)
@@ -112,7 +132,6 @@ def call_gemini(prompt: str) -> str | None:
             err = str(e).lower()
             if "quota" in err or "rate" in err or "429" in err or "exhausted" in err:
                 gemini_rotator.mark_exhausted(key)
-                logger.info(f"Gemini rate limit, coba key lain... (attempt {attempt+1})")
                 continue
             else:
                 logger.error(f"Gemini error: {e}")
@@ -126,10 +145,7 @@ def call_groq(prompt: str) -> str | None:
         if not key:
             return None
         try:
-            headers = {
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
             payload = {
                 "model": "llama-3.3-70b-versatile",
                 "messages": [
@@ -170,16 +186,11 @@ def get_ai_response(prompt: str) -> str | None:
 # ============================================================
 
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler /start — bales user + kirim notif ke owner"""
     user = update.effective_user
     chat = update.effective_chat
 
-    # Bales user yang /start
-    await update.message.reply_text(
-        "Halo! Tanya aja soal crypto, gw siap diskusi 📈"
-    )
+    await update.message.reply_text("Halo! Tanya aja soal crypto, gw siap diskusi 📈")
 
-    # Kirim notif ke owner kalau OWNER_ID sudah diset
     if OWNER_ID:
         notif = (
             f"🔔 Ada yang /start bot!\n\n"
@@ -189,17 +200,12 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 Chat type: {chat.type}"
         )
         try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=notif,
-                parse_mode="HTML"
-            )
+            await context.bot.send_message(chat_id=OWNER_ID, text=notif, parse_mode="HTML")
         except Exception as e:
             logger.error(f"Gagal kirim notif ke owner: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler pesan biasa — grup & DM"""
     message = update.message
     if not message or not message.text:
         return
@@ -209,7 +215,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_private = chat_type == "private"
     is_group = chat_type in ["group", "supergroup"]
 
-    # Tentukan apakah bot harus bales
     if is_private:
         should_reply = DM_ALWAYS_REPLY
     elif is_group:
@@ -221,14 +226,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not should_reply:
         return
 
-    # Delay natural (di DM lebih cepet, di grup lebih santai)
     delay = random.uniform(0.5, 2) if is_private else random.uniform(1, 4)
     await asyncio.sleep(delay)
 
     await context.bot.send_chat_action(chat_id=message.chat_id, action="typing")
 
     response = get_ai_response(message.text)
-
     if response:
         await message.reply_text(response)
         logger.info(f"[{'DM' if is_private else 'Grup'}] Replied: {message.text[:50]}...")
@@ -250,11 +253,14 @@ async def reset_keys_job(context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # Jalanin health check server di thread terpisah
+    thread = threading.Thread(target=run_health_server, daemon=True)
+    thread.start()
 
+    # Jalanin bot
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
     app.job_queue.run_repeating(reset_keys_job, interval=3600, first=3600)
 
     logger.info("Bot nyala!")
